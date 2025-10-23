@@ -304,3 +304,4 @@ logs/
 *.err
 *.bak
 /tmp/
+!system_state.yaml
