@@ -1,0 +1,63 @@
+name: Deploy money-webhook to Cloud Run
+
+on:
+  push:
+    branches: [ feat/money-webhook-handoff ]
+    paths:
+      - 'services/money-webhook/**'
+
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: gcloud - auth via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure gcloud
+        run: |
+          gcloud config set project ${{ secrets.GCP_PROJECT }}
+          gcloud config set run/region ${{ secrets.GCP_REGION }}
+
+      - name: Build & push image
+        working-directory: services/money-webhook
+        run: |
+          IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT }}/docker/money-webhook:${GITHUB_SHA}"
+          gcloud builds submit . --tag "$IMAGE"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy money-webhook \
+            --image "$IMAGE" \
+            --allow-unauthenticated \
+            --cpu=1 --memory=512Mi --timeout=300 \
+            --min-instances=1 --max-instances=10
+
+      - name: Discover webhook URL
+        id: url
+        run: |
+          URL=$(gcloud run services describe money-webhook --format='value(status.url)')
+          echo "url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Wire the swarm runner with MONEY_WEBHOOK_URL
+        run: |
+          URL=${{ steps.url.outputs.url }}
+          gcloud run services update infinity-x-one-swarm --set-env-vars MONEY_WEBHOOK_URL=$URL
+
+      - name: Nudge tick
+        run: |
+          URL=${{ steps.url.outputs.url }}
+          curl -fsS "$URL/healthz" || true
+          curl -fsS "$URL/jobs/tick" || true
