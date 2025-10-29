@@ -1,0 +1,54 @@
+name: ci-deploy
+on:
+  push:
+    branches: ["main"]
+  schedule:
+    - cron: "17 4 * * *"
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Configure Artifact Registry auth
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" -q
+      - name: Build & Deploy (auto-detect Dockerfiles; proper svc names)
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud config set project "$PROJECT_ID"
+          gcloud config set run/region "$REGION"
+          mapfile -t DFS < <(git ls-files | grep -E '(^|/)(Dockerfile|api/Dockerfile)$' || true)
+          if [ "${#DFS[@]}" -eq 0 ]; then echo "No Dockerfiles"; exit 0; fi
+          for df in "${DFS[@]}"; do
+            if [[ "$(basename "$df")" == "Dockerfile" ]]; then
+              svc="$(basename "$(dirname "$df")")"
+              ctx="$(dirname "$df")"
+            else
+              # */api/Dockerfile -> service is parent of 'api', context is that parent
+              svc="$(basename "$(dirname "$(dirname "$df")")")"
+              ctx="$(dirname "$(dirname "$df")")"
+            fi
+            img="${REGION}-docker.pkg.dev/${PROJECT_ID}/swarm/${svc}:${GITHUB_SHA}"
+            echo "[build] $svc -> $img (ctx=$ctx)"
+            gcloud builds submit "$ctx" --tag "$img"
+            gcloud run deploy "$svc" --image "$img" --region "$REGION" --quiet
+          done
+      - name: Smoke /health
+        run: |
+          for s in $(gcloud run services list --format='value(metadata.name)'); do
+            url=$(gcloud run services describe "$s" --region "$REGION" --format='value(status.url)' || true)
+            [ -z "$url" ] && continue
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$url/health" || echo 000)
+            echo "$s /health → $code"
+          done
