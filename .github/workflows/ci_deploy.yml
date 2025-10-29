@@ -1,7 +1,7 @@
 name: ci-deploy
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   schedule:
     - cron: "17 4 * * *"
 permissions:
@@ -20,9 +20,10 @@ jobs:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SA }}
       - uses: google-github-actions/setup-gcloud@v2
-      - name: AR auth
+      - name: Configure Artifact Registry auth
         run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" -q
-      - name: Build & Deploy (auto-detect Dockerfiles)
+      - name: Build & Deploy (auto-detect Dockerfiles; proper svc names)
+        shell: bash
         run: |
           set -euo pipefail
           gcloud config set project "$PROJECT_ID"
@@ -30,12 +31,20 @@ jobs:
           mapfile -t DFS < <(git ls-files | grep -E '(^|/)(Dockerfile|api/Dockerfile)$' || true)
           if [ "${#DFS[@]}" -eq 0 ]; then echo "No Dockerfiles"; exit 0; fi
           for df in "${DFS[@]}"; do
-            svc="$(basename "$(dirname "$df")")"
-            img="${REGION}-docker.pkg.dev/${PROJECT_ID}/swarm/${svc}:$GITHUB_SHA"
-            gcloud builds submit "$(dirname "$df")" --tag "$img"
+            if [[ "$(basename "$df")" == "Dockerfile" ]]; then
+              svc="$(basename "$(dirname "$df")")"
+              ctx="$(dirname "$df")"
+            else
+              # */api/Dockerfile -> service is parent of 'api', context is that parent
+              svc="$(basename "$(dirname "$(dirname "$df")")")"
+              ctx="$(dirname "$(dirname "$df")")"
+            fi
+            img="${REGION}-docker.pkg.dev/${PROJECT_ID}/swarm/${svc}:${GITHUB_SHA}"
+            echo "[build] $svc -> $img (ctx=$ctx)"
+            gcloud builds submit "$ctx" --tag "$img"
             gcloud run deploy "$svc" --image "$img" --region "$REGION" --quiet
           done
-      - name: Smoke health
+      - name: Smoke /health
         run: |
           for s in $(gcloud run services list --format='value(metadata.name)'); do
             url=$(gcloud run services describe "$s" --region "$REGION" --format='value(status.url)' || true)
