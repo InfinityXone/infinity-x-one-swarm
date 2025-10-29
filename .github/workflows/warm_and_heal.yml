@@ -1,0 +1,59 @@
+name: warm-and-heal
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  warm-heal:
+    runs-on: ubuntu-latest
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION:     ${{ vars.GCP_REGION }}
+      WIF_PROVIDER:   ${{ vars.WIF_PROVIDER }}
+      GCP_SA_EMAIL:   ${{ vars.GCP_SA_EMAIL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.GCP_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Heal traffic to latestReady if latestCreated failed
+        run: |
+          set -euo pipefail
+          gcloud config set run/region "${{ env.GCP_REGION }}" >/dev/null
+          mapfile -t SVCS < <(gcloud run services list --format='value(metadata.name)')
+          for S in "${SVCS[@]}"; do
+            LREADY=$(gcloud run services describe "$S" --format='value(status.latestReadyRevisionName)' || true)
+            LCREAT=$(gcloud run services describe "$S" --format='value(status.latestCreatedRevisionName)' || true)
+            URL=$(gcloud run services describe "$S" --format='value(status.url)' || true)
+            if [[ -n "$LREADY" && -n "$LCREAT" && "$LREADY" != "$LCREAT" ]]; then
+              echo "[heal] $S -> route 100% to latestReady: $LREADY"
+              gcloud run services update-traffic "$S" --to-revisions "$LREADY=100" --quiet || true
+            fi
+            if [[ -n "$URL" ]]; then
+              echo "[warm] $S -> $URL/health"
+              IDTOK=$(gcloud auth print-identity-token --audiences="$URL" || true)
+              curl -fsS -H "Authorization: Bearer $IDTOK" "$URL/health" || true
+            fi
+          done
+
+      - name: Profit kick (known endpoints only)
+        run: |
+          set -euo pipefail
+          for S in injector satellite-consumer; do
+            URL=$(gcloud run services describe "$S" --region "${{ env.GCP_REGION }}" --format='value(status.url)' || true)
+            [[ -z "$URL" ]] && { echo "[skip] $S"; continue; }
+            echo "[profit] POST $S -> $URL/harvest"
+            IDTOK=$(gcloud auth print-identity-token --audiences="$URL" || true)
+            curl -fsS -X POST -H "Authorization: Bearer $IDTOK" "$URL/harvest" || true
+          done

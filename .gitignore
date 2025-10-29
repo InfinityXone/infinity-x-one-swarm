@@ -305,3 +305,7 @@ logs/
 *.bak
 /tmp/
 !system_state.yaml
+
+!.github/
+!.github/workflows/
+!.github/workflows/**
